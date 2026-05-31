@@ -54,7 +54,9 @@ class Params:
     strangle_offset_strikes: int = 2
     strike_step: int = 100               # Bank Nifty strike interval — VERIFY
     use_sl: bool = True
-    sl_pct: float = 0.30
+    sl_pct: float = 0.30                 # percentage SL (used when sl_pts == 0)
+    sl_pts: float = 0.0                  # fixed-point SL per leg (0 = use sl_pct)
+    pt_pts: float = 0.0                  # fixed-point profit target per leg (0 = no PT)
     lot_size: int = 15                   # !! Bank Nifty lot size has changed — VERIFY
     lots: int = 1
     capital: float = 200_000.0
@@ -66,17 +68,22 @@ class Params:
 #  SL logic would later live, which is exactly when numba stops being optional)   #
 # ----------------------------------------------------------------------------- #
 @njit(cache=True)
-def _exit_leg(high, close, entry_px, use_sl, sl_pct, slip):
-    """Short leg exit. Pain = premium rising -> scan bar HIGH for first SL breach.
-    Returns (exit_fill_price, reason_code) reason: 0=sl, 1=time, 2=no-data."""
+def _exit_leg(high, low, close, entry_px, use_sl, sl_pct, sl_pts, pt_pts, slip):
+    """Short leg exit. Scans bar-by-bar; SL assumed to hit before PT on same bar.
+    Returns (exit_fill_price, reason_code):
+      0 = SL hit, 1 = time exit, 2 = no-data, 3 = PT hit."""
     n = high.shape[0]
     if n == 0:
         return entry_px + slip, 2
-    if use_sl:
-        thresh = entry_px * (1.0 + sl_pct)
-        for i in range(n):
-            if high[i] >= thresh:
-                return thresh + slip, 0
+
+    sl_thresh = (entry_px + sl_pts) if sl_pts > 0.0 else (entry_px * (1.0 + sl_pct))
+    pt_thresh = (entry_px - pt_pts) if pt_pts > 0.0 else -1.0  # -1 = no PT
+
+    for i in range(n):
+        if use_sl and high[i] >= sl_thresh:
+            return sl_thresh + slip, 0
+        if pt_thresh >= 0.0 and low[i] <= pt_thresh:
+            return pt_thresh - slip, 3  # PT fill: buy back cheaper, so subtract slip
     return close[n - 1] + slip, 1
 
 
@@ -247,14 +254,16 @@ def run_backtest(df: pl.DataFrame, p: Params, c: OptCosts,
             s = (day.filter((pl.col("strike") == strike) & (pl.col("opt_type") == ot)
                             & (pl.col("mins") > p.entry_min) & (pl.col("mins") <= p.exit_min))
                     .sort("mins"))
-            return s.select("high").to_numpy().ravel(), s.select("close").to_numpy().ravel()
+            return (s.select("high").to_numpy().ravel(),
+                    s.select("low").to_numpy().ravel(),
+                    s.select("close").to_numpy().ravel())
 
-        ce_hi, ce_cl = leg_arrays(ce_strike, "CE")
-        pe_hi, pe_cl = leg_arrays(pe_strike, "PE")
+        ce_hi, ce_lo, ce_cl = leg_arrays(ce_strike, "CE")
+        pe_hi, pe_lo, pe_cl = leg_arrays(pe_strike, "PE")
 
-        ce_exit, ce_rc = _exit_leg(ce_hi, ce_cl, ce0, p.use_sl, p.sl_pct, slip)
-        pe_exit, pe_rc = _exit_leg(pe_hi, pe_cl, pe0, p.use_sl, p.sl_pct, slip)
-        reason = {0: "sl", 1: "time", 2: "noexit"}
+        ce_exit, ce_rc = _exit_leg(ce_hi, ce_lo, ce_cl, ce0, p.use_sl, p.sl_pct, p.sl_pts, p.pt_pts, slip)
+        pe_exit, pe_rc = _exit_leg(pe_hi, pe_lo, pe_cl, pe0, p.use_sl, p.sl_pct, p.sl_pts, p.pt_pts, slip)
+        reason = {0: "sl", 1: "time", 2: "noexit", 3: "pt"}
 
         ce_pnl = (ce_in - ce_exit) * units
         pe_pnl = (pe_in - pe_exit) * units
@@ -392,16 +401,21 @@ def main():
                     help="path to VIX parquet (banknifty_chain_vix.parquet by default if --parquet given)")
     ap.add_argument("--vix-max", type=float, default=float("inf"),
                     help="skip trading days where India VIX close > this value (e.g. 18)")
+    ap.add_argument("--sl-pts", type=float, default=0.0,
+                    help="fixed-point SL per leg (e.g. 25); overrides --sl_pct when set")
+    ap.add_argument("--pt-pts", type=float, default=0.0,
+                    help="fixed-point profit target per leg (e.g. 50); 0 = no target")
     ap.add_argument("--vix-sweep", action="store_true",
                     help="sweep VIX thresholds 14-20 + no-filter and print comparison table")
     args = ap.parse_args()
 
     costs = OptCosts()
     params = Params(structure=args.structure, lot_size=args.lot_size,
-                    lots=args.lots, capital=args.capital, vix_max=args.vix_max)
+                    lots=args.lots, capital=args.capital, vix_max=args.vix_max,
+                    sl_pts=args.sl_pts, pt_pts=args.pt_pts)
 
     # warm up the numba kernel so its one-time compile isn't blamed on the strategy
-    _exit_leg(np.array([1.0]), np.array([1.0]), 1.0, True, 0.3, 1.0)
+    _exit_leg(np.array([1.0]), np.array([1.0]), np.array([1.0]), 1.0, True, 0.3, 0.0, 0.0, 1.0)
 
     t_io = _time.perf_counter()
     if args.parquet:
