@@ -58,6 +58,7 @@ class Params:
     lot_size: int = 15                   # !! Bank Nifty lot size has changed — VERIFY
     lots: int = 1
     capital: float = 200_000.0
+    vix_max: float = float("inf")        # skip days where India VIX close > this
 
 
 # ----------------------------------------------------------------------------- #
@@ -186,9 +187,15 @@ def _leg_cost(premium, units, side, c: OptCosts) -> float:
     return brokerage + stt + exch + sebi + stamp + gst
 
 
-def run_backtest(df: pl.DataFrame, p: Params, c: OptCosts) -> pd.DataFrame:
+def run_backtest(df: pl.DataFrame, p: Params, c: OptCosts,
+                 vix: pd.DataFrame | None = None) -> pd.DataFrame:
     units = p.lots * p.lot_size
     slip = c.slippage_points
+
+    # Build VIX lookup {date -> vix_close} for fast per-day filtering
+    vix_map: dict = {}
+    if vix is not None and not vix.empty and p.vix_max < float("inf"):
+        vix_map = {row.date: row.vix for row in vix.itertuples()}
 
     # nearest expiry >= date, vectorized, then keep only those rows
     nexp = (df.select(["date", "expiry"]).unique()
@@ -198,6 +205,9 @@ def run_backtest(df: pl.DataFrame, p: Params, c: OptCosts) -> pd.DataFrame:
 
     trades = []
     for (d,), day in df.partition_by("date", as_dict=True).items():
+        # VIX regime filter — skip high-volatility days
+        if vix_map and vix_map.get(d, 0) > p.vix_max:
+            continue
         # entry snapshot
         snap = day.filter(pl.col("mins") == p.entry_min)
         if snap.height == 0:
@@ -293,13 +303,18 @@ def metrics(trades: pd.DataFrame, capital: float) -> dict:
     }
 
 
-def report(df: pl.DataFrame, base: Params, c: OptCosts):
+def report(df: pl.DataFrame, base: Params, c: OptCosts,
+           vix: pd.DataFrame | None = None):
     dates = sorted(df.select("date").unique().to_series().to_list())
     split = dates[len(dates) // 2]
     train = df.filter(pl.col("date") < split)
     test = df.filter(pl.col("date") >= split)
     print(f"\nData: {dates[0]} -> {dates[-1]}  ({len(dates)} sessions)")
-    print(f"In-sample : {dates[0]} -> {split} (excl.)   Out-sample: {split} -> {dates[-1]}\n")
+    print(f"In-sample : {dates[0]} -> {split} (excl.)   Out-sample: {split} -> {dates[-1]}")
+    if vix is not None and not vix.empty and base.vix_max < float("inf"):
+        print(f"VIX filter : skip days where India VIX > {base.vix_max}\n")
+    else:
+        print()
 
     variants = {
         "Straddle +SL30": Params(**{**base.__dict__, "structure": "straddle", "use_sl": True, "sl_pct": 0.30}),
@@ -310,7 +325,7 @@ def report(df: pl.DataFrame, base: Params, c: OptCosts):
     t0 = _time.perf_counter()
     for name, p in variants.items():
         for label, data in (("in-sample", train), ("out-sample", test)):
-            m = metrics(run_backtest(data, p, c), p.capital)
+            m = metrics(run_backtest(data, p, c, vix=vix), p.capital)
             rows.append({"variant": name, "period": label, **m})
     elapsed = _time.perf_counter() - t0
     out = pd.DataFrame(rows).set_index(["variant", "period"])
@@ -336,11 +351,15 @@ def main():
     ap.add_argument("--lot_size", type=int, default=15)
     ap.add_argument("--lots", type=int, default=1)
     ap.add_argument("--capital", type=float, default=200_000.0)
+    ap.add_argument("--vix-file", default=None,
+                    help="path to VIX parquet (banknifty_chain_vix.parquet by default if --parquet given)")
+    ap.add_argument("--vix-max", type=float, default=float("inf"),
+                    help="skip trading days where India VIX close > this value (e.g. 18)")
     args = ap.parse_args()
 
     costs = OptCosts()
     params = Params(structure=args.structure, lot_size=args.lot_size,
-                    lots=args.lots, capital=args.capital)
+                    lots=args.lots, capital=args.capital, vix_max=args.vix_max)
 
     # warm up the numba kernel so its one-time compile isn't blamed on the strategy
     _exit_leg(np.array([1.0]), np.array([1.0]), 1.0, True, 0.3, 1.0)
@@ -358,7 +377,20 @@ def main():
         df = generate_synthetic()
     print(f"[io] load+normalize in {_time.perf_counter() - t_io:.3f}s")
 
-    report(df, params, costs)
+    # Load VIX data — auto-detect alongside parquet if not explicitly given
+    vix_df = None
+    vix_path = args.vix_file
+    if vix_path is None and args.parquet:
+        vix_path = args.parquet.replace(".parquet", "_vix.parquet")
+    if vix_path:
+        import os
+        if os.path.exists(vix_path):
+            vix_df = pd.read_parquet(vix_path)
+            print(f"[io] loaded VIX data: {len(vix_df)} days from {vix_path}")
+        elif args.vix_max < float("inf"):
+            print(f"[warn] --vix-max set but VIX file not found at {vix_path} — filter disabled")
+
+    report(df, params, costs, vix=vix_df)
 
 
 if __name__ == "__main__":
