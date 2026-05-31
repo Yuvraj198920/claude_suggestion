@@ -1,0 +1,23 @@
+# Credentials - never commit
+secrets.txt
+.env
+
+# Data files
+*.parquet
+*.csv
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# graphify
+graphify-out/
+
+# Logs
+logs/
+*.log
