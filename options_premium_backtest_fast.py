@@ -57,7 +57,7 @@ class Params:
     sl_pct: float = 0.30                 # percentage SL (used when sl_pts == 0)
     sl_pts: float = 0.0                  # fixed-point SL per leg (0 = use sl_pct)
     pt_pts: float = 0.0                  # fixed-point profit target per leg (0 = no PT)
-    lot_size: int = 15                   # !! Bank Nifty lot size has changed — VERIFY
+    lot_size: int = 30                   # Bank Nifty lot size as of 2024
     lots: int = 1
     capital: float = 200_000.0
     vix_max: float = float("inf")        # skip days where India VIX close > this
@@ -394,7 +394,7 @@ def main():
     ap.add_argument("--csv", default=None)
     ap.add_argument("--parquet", default=None)
     ap.add_argument("--structure", default="straddle", choices=["straddle", "strangle"])
-    ap.add_argument("--lot_size", type=int, default=15)
+    ap.add_argument("--lot_size", type=int, default=30)
     ap.add_argument("--lots", type=int, default=1)
     ap.add_argument("--capital", type=float, default=200_000.0)
     ap.add_argument("--vix-file", default=None,
