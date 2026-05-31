@@ -303,6 +303,43 @@ def metrics(trades: pd.DataFrame, capital: float) -> dict:
     }
 
 
+def vix_sweep(df: pl.DataFrame, base: Params, c: OptCosts,
+              vix: pd.DataFrame,
+              thresholds: list[float] | None = None):
+    """Run the best variant (Straddle +SL30) across a range of VIX thresholds
+    and print a single comparison table — out-of-sample only."""
+    if thresholds is None:
+        thresholds = [14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, float("inf")]
+
+    dates = sorted(df.select("date").unique().to_series().to_list())
+    split = dates[len(dates) // 2]
+    test = df.filter(pl.col("date") >= split)
+
+    p_straddle = Params(**{**base.__dict__, "structure": "straddle",
+                           "use_sl": True, "sl_pct": 0.30})
+
+    print(f"\n--- VIX Threshold Sweep (Straddle +SL30, out-of-sample: {split} -> {dates[-1]}) ---\n")
+    rows = []
+    for thresh in thresholds:
+        p = Params(**{**p_straddle.__dict__, "vix_max": thresh})
+        m = metrics(run_backtest(test, p, c, vix=vix), p.capital)
+        label = f"VIX ≤ {thresh:.0f}" if thresh < float("inf") else "No filter"
+        rows.append({"vix_max": label, **m})
+
+    out = pd.DataFrame(rows).set_index("vix_max")
+    pd.set_option("display.width", 200, "display.max_columns", 20)
+    cols = ["trades", "win_rate_%", "profit_factor", "net_pnl", "return_%",
+            "max_dd_%", "sharpe", "worst_day"]
+    print(out[cols].to_string())
+    print()
+
+    # Highlight the best Sharpe
+    valid = out["sharpe"].replace(float("nan"), -999)
+    best = valid.idxmax()
+    print(f"Best Sharpe: {best}  (sharpe={out.loc[best, 'sharpe']}, "
+          f"net_pnl=₹{int(out.loc[best, 'net_pnl']):,})\n")
+
+
 def report(df: pl.DataFrame, base: Params, c: OptCosts,
            vix: pd.DataFrame | None = None):
     dates = sorted(df.select("date").unique().to_series().to_list())
@@ -355,6 +392,8 @@ def main():
                     help="path to VIX parquet (banknifty_chain_vix.parquet by default if --parquet given)")
     ap.add_argument("--vix-max", type=float, default=float("inf"),
                     help="skip trading days where India VIX close > this value (e.g. 18)")
+    ap.add_argument("--vix-sweep", action="store_true",
+                    help="sweep VIX thresholds 14-20 + no-filter and print comparison table")
     args = ap.parse_args()
 
     costs = OptCosts()
@@ -390,7 +429,13 @@ def main():
         elif args.vix_max < float("inf"):
             print(f"[warn] --vix-max set but VIX file not found at {vix_path} — filter disabled")
 
-    report(df, params, costs, vix=vix_df)
+    if args.vix_sweep:
+        if vix_df is None:
+            print("[error] --vix-sweep requires VIX data — run angel_fetch.py first")
+        else:
+            vix_sweep(df, params, costs, vix_df)
+    else:
+        report(df, params, costs, vix=vix_df)
 
 
 if __name__ == "__main__":
