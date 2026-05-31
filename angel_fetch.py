@@ -53,6 +53,7 @@ INSTRUMENT_URL = ("https://margincalculator.angelbroking.com/"
 SLEEP_SEC = 0.45            # between candle calls; raise if throttled
 ONEMIN_CHUNK_DAYS = 25      # stay under the ~30-day 1-minute window
 STRIKE_STEP = 100           # Bank Nifty — VERIFY
+INDIAVIX_TOKEN = "99926017" # NSE India VIX index token
 
 
 # --------------------------------------------------------------------------- #
@@ -210,6 +211,27 @@ def daily_index_close(sc, token: str, start: date, end: date) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+#  INDIA VIX  (daily close — used as volatility regime filter in backtests)   #
+# --------------------------------------------------------------------------- #
+def fetch_vix_daily(sc, start: date, end: date) -> pd.DataFrame:
+    """Daily India VIX closes from Angel One. Returns DataFrame with date + vix columns."""
+    rows = []
+    for frm, to in chunk_ranges(start, end, 90):
+        params = {"exchange": "NSE", "symboltoken": INDIAVIX_TOKEN,
+                  "interval": "ONE_DAY", "fromdate": frm, "todate": to}
+        try:
+            resp = sc.getCandleData(params)
+            for row in resp.get("data", []):
+                rows.append({"date": pd.to_datetime(row[0]).date(), "vix": float(row[4])})
+        except Exception as e:
+            print(f"  VIX fetch issue: {e}")
+        time.sleep(SLEEP_SEC)
+    if not rows:
+        return pd.DataFrame(columns=["date", "vix"])
+    return pd.DataFrame(rows).drop_duplicates("date").sort_values("date").reset_index(drop=True)
+
+
+# --------------------------------------------------------------------------- #
 #  ASSEMBLE  (pure logic — unit-tested)                                       #
 # --------------------------------------------------------------------------- #
 def assemble(candle_frames: list) -> pd.DataFrame:
@@ -294,12 +316,21 @@ def build(weeks: int, band: int, out_path: str, all_expiries: bool = False):
     if df.empty:
         print("    no data assembled — check limits above."); return
     try:
-        df.to_parquet(out_path, index=False)          # pandas handles dtypes cleanly
+        df.to_parquet(out_path, index=False)
     except Exception as e:
         print(f"    parquet engine missing (pip install pyarrow): {e}")
         df.to_csv(out_path.replace('.parquet', '.csv'), index=False)
         print("    fell back to CSV")
     print(f"    wrote {len(df):,} rows, {df['datetime'].dt.date.nunique()} sessions -> {out_path}")
+
+    print(f"[7] fetching India VIX daily closes")
+    vix_df = fetch_vix_daily(sc, data_start, today)
+    if not vix_df.empty:
+        vix_path = out_path.replace(".parquet", "_vix.parquet")
+        vix_df.to_parquet(vix_path, index=False)
+        print(f"    wrote {len(vix_df)} days of VIX data -> {vix_path}")
+    else:
+        print("    no VIX data returned — filter will be unavailable")
 
 
 def main():

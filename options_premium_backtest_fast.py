@@ -54,10 +54,13 @@ class Params:
     strangle_offset_strikes: int = 2
     strike_step: int = 100               # Bank Nifty strike interval — VERIFY
     use_sl: bool = True
-    sl_pct: float = 0.30
-    lot_size: int = 15                   # !! Bank Nifty lot size has changed — VERIFY
+    sl_pct: float = 0.30                 # percentage SL (used when sl_pts == 0)
+    sl_pts: float = 0.0                  # fixed-point SL per leg (0 = use sl_pct)
+    pt_pts: float = 0.0                  # fixed-point profit target per leg (0 = no PT)
+    lot_size: int = 30                   # Bank Nifty lot size as of 2024
     lots: int = 1
     capital: float = 200_000.0
+    vix_max: float = float("inf")        # skip days where India VIX close > this
 
 
 # ----------------------------------------------------------------------------- #
@@ -65,17 +68,22 @@ class Params:
 #  SL logic would later live, which is exactly when numba stops being optional)   #
 # ----------------------------------------------------------------------------- #
 @njit(cache=True)
-def _exit_leg(high, close, entry_px, use_sl, sl_pct, slip):
-    """Short leg exit. Pain = premium rising -> scan bar HIGH for first SL breach.
-    Returns (exit_fill_price, reason_code) reason: 0=sl, 1=time, 2=no-data."""
+def _exit_leg(high, low, close, entry_px, use_sl, sl_pct, sl_pts, pt_pts, slip):
+    """Short leg exit. Scans bar-by-bar; SL assumed to hit before PT on same bar.
+    Returns (exit_fill_price, reason_code):
+      0 = SL hit, 1 = time exit, 2 = no-data, 3 = PT hit."""
     n = high.shape[0]
     if n == 0:
         return entry_px + slip, 2
-    if use_sl:
-        thresh = entry_px * (1.0 + sl_pct)
-        for i in range(n):
-            if high[i] >= thresh:
-                return thresh + slip, 0
+
+    sl_thresh = (entry_px + sl_pts) if sl_pts > 0.0 else (entry_px * (1.0 + sl_pct))
+    pt_thresh = (entry_px - pt_pts) if pt_pts > 0.0 else -1.0  # -1 = no PT
+
+    for i in range(n):
+        if use_sl and high[i] >= sl_thresh:
+            return sl_thresh + slip, 0
+        if pt_thresh >= 0.0 and low[i] <= pt_thresh:
+            return pt_thresh - slip, 3  # PT fill: buy back cheaper, so subtract slip
     return close[n - 1] + slip, 1
 
 
@@ -186,9 +194,15 @@ def _leg_cost(premium, units, side, c: OptCosts) -> float:
     return brokerage + stt + exch + sebi + stamp + gst
 
 
-def run_backtest(df: pl.DataFrame, p: Params, c: OptCosts) -> pd.DataFrame:
+def run_backtest(df: pl.DataFrame, p: Params, c: OptCosts,
+                 vix: pd.DataFrame | None = None) -> pd.DataFrame:
     units = p.lots * p.lot_size
     slip = c.slippage_points
+
+    # Build VIX lookup {date -> vix_close} for fast per-day filtering
+    vix_map: dict = {}
+    if vix is not None and not vix.empty and p.vix_max < float("inf"):
+        vix_map = {row.date: row.vix for row in vix.itertuples()}
 
     # nearest expiry >= date, vectorized, then keep only those rows
     nexp = (df.select(["date", "expiry"]).unique()
@@ -198,6 +212,9 @@ def run_backtest(df: pl.DataFrame, p: Params, c: OptCosts) -> pd.DataFrame:
 
     trades = []
     for (d,), day in df.partition_by("date", as_dict=True).items():
+        # VIX regime filter — skip high-volatility days
+        if vix_map and vix_map.get(d, 0) > p.vix_max:
+            continue
         # entry snapshot
         snap = day.filter(pl.col("mins") == p.entry_min)
         if snap.height == 0:
@@ -237,14 +254,16 @@ def run_backtest(df: pl.DataFrame, p: Params, c: OptCosts) -> pd.DataFrame:
             s = (day.filter((pl.col("strike") == strike) & (pl.col("opt_type") == ot)
                             & (pl.col("mins") > p.entry_min) & (pl.col("mins") <= p.exit_min))
                     .sort("mins"))
-            return s.select("high").to_numpy().ravel(), s.select("close").to_numpy().ravel()
+            return (s.select("high").to_numpy().ravel(),
+                    s.select("low").to_numpy().ravel(),
+                    s.select("close").to_numpy().ravel())
 
-        ce_hi, ce_cl = leg_arrays(ce_strike, "CE")
-        pe_hi, pe_cl = leg_arrays(pe_strike, "PE")
+        ce_hi, ce_lo, ce_cl = leg_arrays(ce_strike, "CE")
+        pe_hi, pe_lo, pe_cl = leg_arrays(pe_strike, "PE")
 
-        ce_exit, ce_rc = _exit_leg(ce_hi, ce_cl, ce0, p.use_sl, p.sl_pct, slip)
-        pe_exit, pe_rc = _exit_leg(pe_hi, pe_cl, pe0, p.use_sl, p.sl_pct, slip)
-        reason = {0: "sl", 1: "time", 2: "noexit"}
+        ce_exit, ce_rc = _exit_leg(ce_hi, ce_lo, ce_cl, ce0, p.use_sl, p.sl_pct, p.sl_pts, p.pt_pts, slip)
+        pe_exit, pe_rc = _exit_leg(pe_hi, pe_lo, pe_cl, pe0, p.use_sl, p.sl_pct, p.sl_pts, p.pt_pts, slip)
+        reason = {0: "sl", 1: "time", 2: "noexit", 3: "pt"}
 
         ce_pnl = (ce_in - ce_exit) * units
         pe_pnl = (pe_in - pe_exit) * units
@@ -293,13 +312,55 @@ def metrics(trades: pd.DataFrame, capital: float) -> dict:
     }
 
 
-def report(df: pl.DataFrame, base: Params, c: OptCosts):
+def vix_sweep(df: pl.DataFrame, base: Params, c: OptCosts,
+              vix: pd.DataFrame,
+              thresholds: list[float] | None = None):
+    """Run the best variant (Straddle +SL30) across a range of VIX thresholds
+    and print a single comparison table — out-of-sample only."""
+    if thresholds is None:
+        thresholds = [14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, float("inf")]
+
+    dates = sorted(df.select("date").unique().to_series().to_list())
+    split = dates[len(dates) // 2]
+    test = df.filter(pl.col("date") >= split)
+
+    p_straddle = Params(**{**base.__dict__, "structure": "straddle",
+                           "use_sl": True, "sl_pct": 0.30})
+
+    print(f"\n--- VIX Threshold Sweep (Straddle +SL30, out-of-sample: {split} -> {dates[-1]}) ---\n")
+    rows = []
+    for thresh in thresholds:
+        p = Params(**{**p_straddle.__dict__, "vix_max": thresh})
+        m = metrics(run_backtest(test, p, c, vix=vix), p.capital)
+        label = f"VIX ≤ {thresh:.0f}" if thresh < float("inf") else "No filter"
+        rows.append({"vix_max": label, **m})
+
+    out = pd.DataFrame(rows).set_index("vix_max")
+    pd.set_option("display.width", 200, "display.max_columns", 20)
+    cols = ["trades", "win_rate_%", "profit_factor", "net_pnl", "return_%",
+            "max_dd_%", "sharpe", "worst_day"]
+    print(out[cols].to_string())
+    print()
+
+    # Highlight the best Sharpe
+    valid = out["sharpe"].replace(float("nan"), -999)
+    best = valid.idxmax()
+    print(f"Best Sharpe: {best}  (sharpe={out.loc[best, 'sharpe']}, "
+          f"net_pnl=₹{int(out.loc[best, 'net_pnl']):,})\n")
+
+
+def report(df: pl.DataFrame, base: Params, c: OptCosts,
+           vix: pd.DataFrame | None = None):
     dates = sorted(df.select("date").unique().to_series().to_list())
     split = dates[len(dates) // 2]
     train = df.filter(pl.col("date") < split)
     test = df.filter(pl.col("date") >= split)
     print(f"\nData: {dates[0]} -> {dates[-1]}  ({len(dates)} sessions)")
-    print(f"In-sample : {dates[0]} -> {split} (excl.)   Out-sample: {split} -> {dates[-1]}\n")
+    print(f"In-sample : {dates[0]} -> {split} (excl.)   Out-sample: {split} -> {dates[-1]}")
+    if vix is not None and not vix.empty and base.vix_max < float("inf"):
+        print(f"VIX filter : skip days where India VIX > {base.vix_max}\n")
+    else:
+        print()
 
     variants = {
         "Straddle +SL30": Params(**{**base.__dict__, "structure": "straddle", "use_sl": True, "sl_pct": 0.30}),
@@ -310,7 +371,7 @@ def report(df: pl.DataFrame, base: Params, c: OptCosts):
     t0 = _time.perf_counter()
     for name, p in variants.items():
         for label, data in (("in-sample", train), ("out-sample", test)):
-            m = metrics(run_backtest(data, p, c), p.capital)
+            m = metrics(run_backtest(data, p, c, vix=vix), p.capital)
             rows.append({"variant": name, "period": label, **m})
     elapsed = _time.perf_counter() - t0
     out = pd.DataFrame(rows).set_index(["variant", "period"])
@@ -333,17 +394,28 @@ def main():
     ap.add_argument("--csv", default=None)
     ap.add_argument("--parquet", default=None)
     ap.add_argument("--structure", default="straddle", choices=["straddle", "strangle"])
-    ap.add_argument("--lot_size", type=int, default=15)
+    ap.add_argument("--lot_size", type=int, default=30)
     ap.add_argument("--lots", type=int, default=1)
     ap.add_argument("--capital", type=float, default=200_000.0)
+    ap.add_argument("--vix-file", default=None,
+                    help="path to VIX parquet (banknifty_chain_vix.parquet by default if --parquet given)")
+    ap.add_argument("--vix-max", type=float, default=float("inf"),
+                    help="skip trading days where India VIX close > this value (e.g. 18)")
+    ap.add_argument("--sl-pts", type=float, default=0.0,
+                    help="fixed-point SL per leg (e.g. 25); overrides --sl_pct when set")
+    ap.add_argument("--pt-pts", type=float, default=0.0,
+                    help="fixed-point profit target per leg (e.g. 50); 0 = no target")
+    ap.add_argument("--vix-sweep", action="store_true",
+                    help="sweep VIX thresholds 14-20 + no-filter and print comparison table")
     args = ap.parse_args()
 
     costs = OptCosts()
     params = Params(structure=args.structure, lot_size=args.lot_size,
-                    lots=args.lots, capital=args.capital)
+                    lots=args.lots, capital=args.capital, vix_max=args.vix_max,
+                    sl_pts=args.sl_pts, pt_pts=args.pt_pts)
 
     # warm up the numba kernel so its one-time compile isn't blamed on the strategy
-    _exit_leg(np.array([1.0]), np.array([1.0]), 1.0, True, 0.3, 1.0)
+    _exit_leg(np.array([1.0]), np.array([1.0]), np.array([1.0]), 1.0, True, 0.3, 0.0, 0.0, 1.0)
 
     t_io = _time.perf_counter()
     if args.parquet:
@@ -358,7 +430,26 @@ def main():
         df = generate_synthetic()
     print(f"[io] load+normalize in {_time.perf_counter() - t_io:.3f}s")
 
-    report(df, params, costs)
+    # Load VIX data — auto-detect alongside parquet if not explicitly given
+    vix_df = None
+    vix_path = args.vix_file
+    if vix_path is None and args.parquet:
+        vix_path = args.parquet.replace(".parquet", "_vix.parquet")
+    if vix_path:
+        import os
+        if os.path.exists(vix_path):
+            vix_df = pd.read_parquet(vix_path)
+            print(f"[io] loaded VIX data: {len(vix_df)} days from {vix_path}")
+        elif args.vix_max < float("inf"):
+            print(f"[warn] --vix-max set but VIX file not found at {vix_path} — filter disabled")
+
+    if args.vix_sweep:
+        if vix_df is None:
+            print("[error] --vix-sweep requires VIX data — run angel_fetch.py first")
+        else:
+            vix_sweep(df, params, costs, vix_df)
+    else:
+        report(df, params, costs, vix=vix_df)
 
 
 if __name__ == "__main__":
